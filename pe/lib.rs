@@ -15,6 +15,7 @@ pub mod coff;
 mod arch;
 mod image;
 mod link;
+mod pdb;
 
 use std::ffi::OsString;
 use std::path::Path;

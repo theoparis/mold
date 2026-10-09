@@ -26,7 +26,6 @@ const SUBSYSTEMS: &[(&str, u16)] = &[
 /// implemented (no PDB or manifest is written) or is the default.
 const IGNORED_OPTIONS: &[&str] = &[
     "nologo",
-    "pdb",
     "pdbaltpath",
     "incremental",
     "manifest",
@@ -53,6 +52,10 @@ pub struct Options {
     /// Set by /nodefaultlib, which makes the link ignore libraries that objects ask for.
     pub no_default_lib: bool,
     pub inputs: Vec<PathBuf>,
+    /// Set by /debug, which writes a PDB file for the image.
+    pub debug: bool,
+    /// The PDB file that /pdb: names, if given.
+    pub pdb: Option<PathBuf>,
 }
 
 /// Parses the arguments of a linker invocation. `argv[0]` is the program
@@ -75,6 +78,8 @@ pub fn parse(argv: &[OsString]) -> Options {
         machine: None,
         no_default_lib: false,
         inputs: Vec::new(),
+        debug: false,
+        pdb: None,
     };
     let mut debug = false;
     let mut opt_ref = None;
@@ -131,6 +136,7 @@ pub fn parse(argv: &[OsString]) -> Options {
             ("nxcompat", None | Some("yes")) => opts.nxcompat = true,
             ("nxcompat", Some("no")) => opts.nxcompat = false,
             ("debug", _) => debug = true,
+            ("pdb", Some(v)) => opts.pdb = Some(PathBuf::from(v)),
             ("nodefaultlib", None) => opts.no_default_lib = true,
             ("nodefaultlib", Some(_)) => {}
             (n, _) if IGNORED_OPTIONS.contains(&n) => {}
@@ -148,6 +154,7 @@ pub fn parse(argv: &[OsString]) -> Options {
 
     // Like lld, optimize away unreferenced sections unless debugging.
     opts.gc_sections = opt_ref.unwrap_or(!debug);
+    opts.debug = debug;
     if opts.inputs.is_empty() {
         fatal!("no input files");
     }

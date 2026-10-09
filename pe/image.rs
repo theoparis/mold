@@ -12,6 +12,7 @@ use crate::arch::x86_64::X86_64;
 use crate::arch::{Arch, Fixup, RelocError, Target};
 use crate::coff::{self, SCN_CNT_CODE, SCN_CNT_INITIALIZED_DATA, SCN_CNT_UNINITIALIZED_DATA};
 use crate::link::{Linker, Loc};
+use crate::pdb::{self, dbi::SectionContrib};
 
 /// The image base that lld uses for executables, so that 32-bit absolute
 /// addresses (`IMAGE_REL_AMD64_ADDR32`) come out as lld writes them.
@@ -27,6 +28,20 @@ const OPTIONAL_HEADER_SIZE: usize = 240;
 const SECTION_HEADER_SIZE: usize = 40;
 const NUM_DATA_DIRECTORIES: usize = 16;
 const BASE_RELOC_DIRECTORY: usize = 5;
+const DEBUG_DIRECTORY: usize = 6;
+/// The size of an IMAGE_DEBUG_DIRECTORY entry.
+const DEBUG_DIRECTORY_SIZE: usize = 28;
+/// The fixed part of a CodeView RSDS record: signature, GUID and age.
+const CODEVIEW_HEADER_SIZE: usize = 24;
+/// The debug directory type for a CodeView record.
+const IMAGE_DEBUG_TYPE_CODEVIEW: u32 = 2;
+
+/// Where the CodeView record of the PDB goes in the image. Its contents depend
+/// on the PDB, which depends on the layout, so they are written afterward.
+pub(crate) struct DebugRecord {
+    pub file_off: usize,
+    pub len: usize,
+}
 
 const RELOC_SECTION_CHARS: u32 = 0x4200_0040;
 
@@ -87,16 +102,24 @@ struct OutSection {
 
 /// Lays out the live chunks of `ln` and returns the image, for the machine
 /// type of the input objects.
-pub(crate) fn build(ln: &mut Linker<'_>, entry: u32) -> Vec<u8> {
+pub(crate) fn build(
+    ln: &mut Linker<'_>,
+    entry: u32,
+    pdb_path: Option<&str>,
+) -> (Vec<u8>, pdb::Input, Option<DebugRecord>) {
     match ln.machine {
-        Some(machine) if machine == X86_64::MACHINE => build_for::<X86_64>(ln, entry),
+        Some(machine) if machine == X86_64::MACHINE => build_for::<X86_64>(ln, entry, pdb_path),
         Some(machine) => fatal!("unsupported machine type 0x{machine:04x}"),
         None => fatal!("no input object files"),
     }
 }
 
 /// Lays out the live chunks of `ln` and returns the image for architecture `A`.
-fn build_for<A: Arch>(ln: &mut Linker<'_>, entry: u32) -> Vec<u8> {
+fn build_for<A: Arch>(
+    ln: &mut Linker<'_>,
+    entry: u32,
+    pdb_path: Option<&str>,
+) -> (Vec<u8>, pdb::Input, Option<DebugRecord>) {
     let image_base = ln.opts.image_base.unwrap_or(DEFAULT_IMAGE_BASE);
 
     let mut outs = group_chunks(ln);
@@ -119,6 +142,34 @@ fn build_for<A: Arch>(ln: &mut Linker<'_>, entry: u32) -> Vec<u8> {
         out.init_size = init_size;
         out.virt_size = cursor;
     }
+
+    // lld keeps the debug directory and its CodeView record at the end of
+    // .rdata, so they take part in its layout. The record is as long as the
+    // path, which is known before the PDB is written.
+    let debug_at = pdb_path.map(|p| {
+        let rec_len = CODEVIEW_HEADER_SIZE + p.len() + 1;
+        let idx = match outs.iter().position(|o| o.name == b".rdata") {
+            Some(i) => i,
+            None => {
+                outs.push(OutSection {
+                    name: b".rdata".to_vec(),
+                    chars: SCN_CNT_INITIALIZED_DATA | coff::SCN_MEM_READ,
+                    members: Vec::new(),
+                    init_size: 0,
+                    virt_size: 0,
+                    rva: 0,
+                    raw_off: 0,
+                    raw_size: 0,
+                });
+                outs.len() - 1
+            }
+        };
+        let out = &mut outs[idx];
+        let at = align_to(out.virt_size, 4);
+        out.virt_size = at + (DEBUG_DIRECTORY_SIZE + rec_len) as u64;
+        out.init_size = out.virt_size;
+        (idx, at, rec_len)
+    });
 
     let ln_ref: &Linker<'_> = ln;
     let have_relocs = outs
@@ -145,6 +196,11 @@ fn build_for<A: Arch>(ln: &mut Linker<'_>, entry: u32) -> Vec<u8> {
         rva += align_to(out.virt_size, SECTION_ALIGN);
     }
 
+    // The debug directory and its record, as places in the file.
+    let debug_slot = debug_at.map(|(idx, at, rec_len)| {
+        let out = &outs[idx];
+        (out.rva + at, (out.raw_off + at) as usize, rec_len)
+    });
     // The RVA and file offset of every chunk that the image keeps.
     let mut chunk_rva = vec![0u64; ln.chunks.len()];
     let mut chunk_file = vec![0u64; ln.chunks.len()];
@@ -236,10 +292,80 @@ fn build_for<A: Arch>(ln: &mut Linker<'_>, entry: u32) -> Vec<u8> {
         size_of_image: align_to(rva, SECTION_ALIGN),
         size_of_headers: headers_size,
         reloc_dir,
+        debug_dir: debug_slot.map_or((0, 0), |(rva, _, _)| (rva, DEBUG_DIRECTORY_SIZE as u64)),
     };
     let sections: Vec<&OutSection> = outs.iter().filter(|o| o.virt_size > 0).collect();
+    let debug_record = debug_slot.map(|(rva, off, len)| {
+        write_debug_directory(&mut image, off, rva, len);
+        DebugRecord { file_off: off + DEBUG_DIRECTORY_SIZE, len }
+    });
     write_headers(&mut image, &headers, &sections);
-    image
+    let pdb = pdb_input::<A>(ln, &sections, &image, pdb_path);
+    (image, pdb, debug_record)
+}
+
+/// Describes the linked image for its PDB: the modules that contributed
+/// chunks, the chunks as section contributions, and the section table.
+fn pdb_input<A: Arch>(
+    ln: &Linker<'_>,
+    sections: &[&OutSection],
+    image: &[u8],
+    pdb_path: Option<&str>,
+) -> pdb::Input {
+    let mut module_of = vec![None; ln.objs.len()];
+    let mut modules = Vec::new();
+    for (oi, obj) in ln.objs.iter().enumerate() {
+        if ln.included[oi] {
+            module_of[oi] = Some(modules.len() as u16);
+            modules.push(pdb::ModuleInput {
+                name: obj.name.clone(),
+                obj_name: obj.name.clone(),
+                symbols: Vec::new(),
+                first_contrib: SectionContrib::default(),
+            });
+        }
+    }
+
+    let mut contribs = Vec::new();
+    for (si, out) in sections.iter().enumerate() {
+        for m in &out.members {
+            let ch = &ln.chunks[m.chunk as usize];
+            let module = module_of[ch.obj as usize].expect("chunk from an included object");
+            contribs.push(SectionContrib {
+                section: (si + 1) as u16,
+                offset: ch.offset,
+                size: ch.size as u32,
+                characteristics: out.chars,
+                module,
+            });
+        }
+    }
+    let mut seen = vec![false; modules.len()];
+    for c in &contribs {
+        let m = c.module as usize;
+        if !seen[m] {
+            seen[m] = true;
+            modules[m].first_contrib = *c;
+        }
+    }
+
+    let start = (PE_OFFSET + 4 + COFF_HEADER_SIZE + OPTIONAL_HEADER_SIZE) as usize;
+    let len = SECTION_HEADER_SIZE as usize * sections.len();
+    pdb::Input {
+        age: 1,
+        pdb_path: pdb_path.unwrap_or_default().to_string(),
+        machine: A::MACHINE,
+        modules,
+        contribs,
+        sections: sections
+            .iter()
+            .map(|o| pdb::dbi::Section {
+                characteristics: o.chars,
+                virtual_size: o.virt_size as u32,
+            })
+            .collect(),
+        section_headers: image[start..start + len].to_vec(),
+    }
 }
 
 /// Groups the live chunks by output section name. Input sections whose names
@@ -439,6 +565,21 @@ struct Headers {
     size_of_image: u64,
     size_of_headers: u64,
     reloc_dir: (u64, u64),
+    debug_dir: (u64, u64),
+}
+
+/// Writes the IMAGE_DEBUG_DIRECTORY entry at `dir_rva` and `dir_off`. The
+/// CodeView record follows the entry, and the entry points to it.
+fn write_debug_directory(image: &mut [u8], dir_off: usize, dir_rva: u64, rec_len: usize) {
+    let rec_rva = dir_rva + DEBUG_DIRECTORY_SIZE as u64;
+    let rec_off = dir_off + DEBUG_DIRECTORY_SIZE;
+    let mut entry = [0u8; DEBUG_DIRECTORY_SIZE];
+    // Characteristics, TimeDateStamp and the version are zero.
+    entry[12..16].copy_from_slice(&IMAGE_DEBUG_TYPE_CODEVIEW.to_le_bytes());
+    entry[16..20].copy_from_slice(&(rec_len as u32).to_le_bytes());
+    entry[20..24].copy_from_slice(&(rec_rva as u32).to_le_bytes());
+    entry[24..28].copy_from_slice(&(rec_off as u32).to_le_bytes());
+    put(image, dir_off, &entry);
 }
 
 fn put(buf: &mut [u8], at: usize, bytes: &[u8]) {
@@ -495,6 +636,9 @@ fn write_headers(image: &mut [u8], h: &Headers, sections: &[&OutSection]) {
     let dir = opt + 112 + BASE_RELOC_DIRECTORY * 8;
     put(image, dir, &(h.reloc_dir.0 as u32).to_le_bytes());
     put(image, dir + 4, &(h.reloc_dir.1 as u32).to_le_bytes());
+    let debug = opt + 112 + DEBUG_DIRECTORY * 8;
+    put(image, debug, &(h.debug_dir.0 as u32).to_le_bytes());
+    put(image, debug + 4, &(h.debug_dir.1 as u32).to_le_bytes());
 
     // Section table. A section with initialized data has no uninitialized
     // flag: its uninitialized tail is just part of its virtual size.

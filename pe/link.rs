@@ -22,6 +22,7 @@ use mold_common::output_file::OutputFile;
 use crate::args::{self, Options};
 use crate::coff::{self, Object};
 use crate::image;
+use crate::pdb;
 
 /// The value of a chunk index that refers to nothing.
 pub(crate) const NO_CHUNK: u32 = u32::MAX;
@@ -702,7 +703,22 @@ pub fn link(opts: Options) {
     ln.check_undefined();
     ln.compute_liveness();
 
-    let image = image::build(&mut ln, entry);
+    let pdb_file =
+        ln.opts.debug.then(|| ln.opts.pdb.clone().unwrap_or_else(|| output.with_extension("pdb")));
+    let pdb_path = pdb_file.as_ref().map(|p| {
+        std::path::absolute(p)
+            .unwrap_or_else(|e| fatal!("{}: {e}", p.display()))
+            .display()
+            .to_string()
+    });
+    let (mut image, pdb_input, debug_record) = image::build(&mut ln, entry, pdb_path.as_deref());
+
+    if let (Some(file), Some(path), Some(record)) = (&pdb_file, &pdb_path, debug_record) {
+        let (bytes, guid) = pdb::write(&pdb_input);
+        let rsds = pdb::codeview_record(guid, pdb_input.age, path);
+        image[record.file_off..record.file_off + record.len].copy_from_slice(&rsds);
+        std::fs::write(file, bytes).unwrap_or_else(|e| fatal!("{}: {e}", file.display()));
+    }
 
     let mut out = OutputFile::open(&output, image.len() as u64, 0o755, false, false);
     out.buf().copy_from_slice(&image);
