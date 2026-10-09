@@ -711,7 +711,17 @@ pub fn link(opts: Options) {
             .display()
             .to_string()
     });
-    let (mut image, pdb_input, debug_record) = image::build(&mut ln, entry, pdb_path.as_deref());
+    let (mut image, mut pdb_input, debug_record) =
+        image::build(&mut ln, entry, pdb_path.as_deref());
+    pdb_input.env = pdb::symbols::Env {
+        cwd: std::env::current_dir().unwrap_or_default().display().to_string(),
+        exe: std::path::absolute(&ln.opts.program)
+            .unwrap_or_else(|_| ln.opts.program.clone())
+            .display()
+            .to_string(),
+        command_line: ln.opts.command_line.clone(),
+        pdb: String::new(),
+    };
 
     if let (Some(file), Some(path), Some(record)) = (&pdb_file, &pdb_path, debug_record) {
         let (bytes, guid) = pdb::write(&pdb_input);

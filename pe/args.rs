@@ -56,6 +56,10 @@ pub struct Options {
     pub debug: bool,
     /// The PDB file that /pdb: names, if given.
     pub pdb: Option<PathBuf>,
+    /// The program that was run, as it was named on the command line.
+    pub program: PathBuf,
+    /// The arguments, quoted and joined by spaces, as lld records them.
+    pub command_line: String,
 }
 
 /// Parses the arguments of a linker invocation. `argv[0]` is the program
@@ -67,6 +71,7 @@ pub fn parse(argv: &[OsString]) -> Options {
         raw.drain(..2);
     }
 
+    let command_line = quote_args(&raw);
     let mut opts = Options {
         output: PathBuf::from("a.exe"),
         entry: None,
@@ -80,6 +85,8 @@ pub fn parse(argv: &[OsString]) -> Options {
         inputs: Vec::new(),
         debug: false,
         pdb: None,
+        program: PathBuf::from(&argv[0]),
+        command_line,
     };
     let mut debug = false;
     let mut opt_ref = None;
@@ -232,4 +239,20 @@ pub(crate) fn split_command_line(text: &str) -> Vec<String> {
         args.push(cur);
     }
     args
+}
+
+/// Joins arguments with spaces, quoting those that contain spaces or quotes,
+/// as lld records the command line in its PDB.
+fn quote_args(args: &[OsString]) -> String {
+    args.iter()
+        .map(|a| {
+            let s = a.to_string_lossy();
+            if s.is_empty() || s.contains([' ', '"']) {
+                format!("\"{}\"", s.replace('"', "\\\""))
+            } else {
+                s.into_owned()
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
 }

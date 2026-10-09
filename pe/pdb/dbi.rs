@@ -47,6 +47,8 @@ pub struct Module {
     /// The module's name, usually the object file's path.
     pub name: String,
     pub obj_name: String,
+    /// The index in the EC names of the PDB path, which the linker module names.
+    pub pdb_path_ni: u32,
     /// The module's symbol stream, or `NIL_STREAM` if it has none.
     pub stream: u16,
     /// Length of the symbol substream, including its signature.
@@ -57,6 +59,9 @@ pub struct Module {
 
 /// The fields of an output section that the section map records.
 pub struct Section {
+    pub name: Vec<u8>,
+    /// The section's address, relative to the image base.
+    pub rva: u32,
     pub characteristics: u32,
     pub virtual_size: u32,
 }
@@ -92,8 +97,8 @@ fn module_record(m: &Module) -> Vec<u8> {
     out.extend_from_slice(&0u16.to_le_bytes());
     out.extend_from_slice(&[0u8; 2]);
     out.extend_from_slice(&0u32.to_le_bytes());
-    out.extend_from_slice(&0u32.to_le_bytes());
-    out.extend_from_slice(&0u32.to_le_bytes());
+    out.extend_from_slice(&0u32.to_le_bytes()); // SrcFileNameNI
+    out.extend_from_slice(&m.pdb_path_ni.to_le_bytes());
     out.extend_from_slice(m.name.as_bytes());
     out.push(0);
     out.extend_from_slice(m.obj_name.as_bytes());

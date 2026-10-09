@@ -405,16 +405,51 @@ fn pdb_input<A: Arch>(
             function: functions.contains(g.name),
         });
     }
+
+    // The COFF groups of each output section: one per partial section, which
+    // spans the chunks that the section holds, in lld's partial section order.
+    let mut groups = Vec::new();
+    for (si, out) in sections.iter().enumerate() {
+        let mut by_key: std::collections::BTreeMap<u32, (Vec<u8>, u32, u32, u32)> =
+            std::collections::BTreeMap::new();
+        for m in &out.members {
+            let ch = &ln.chunks[m.chunk as usize];
+            let sec = &ln.objs[ch.obj as usize].sections[ch.sec as usize];
+            let end = ch.offset + ch.size as u32;
+            let entry = by_key.entry(m.partial).or_insert_with(|| {
+                (sec.name.to_vec(), sec.characteristics & OUTPUT_CHAR_MASK, ch.offset, end)
+            });
+            entry.2 = entry.2.min(ch.offset);
+            entry.3 = entry.3.max(end);
+        }
+        let mut section_groups: Vec<pdb::symbols::CoffGroup> = by_key
+            .into_values()
+            .map(|(name, characteristics, start, end)| pdb::symbols::CoffGroup {
+                section: (si + 1) as u16,
+                name,
+                characteristics,
+                offset: start,
+                size: end - start,
+            })
+            .collect();
+        // lld lists a section's groups in the order they are laid out.
+        section_groups.sort_by_key(|g| g.offset);
+        groups.extend(section_groups);
+    }
     pdb::Input {
         age: 1,
         pdb_path: pdb_path.unwrap_or_default().to_string(),
         publics,
+        groups,
+        env: pdb::symbols::Env::default(),
         machine: A::MACHINE,
         modules,
         contribs,
         sections: sections
             .iter()
             .map(|o| pdb::dbi::Section {
+                name: o.name.clone(),
+                rva: o.rva as u32,
                 characteristics: o.chars,
                 virtual_size: o.virt_size as u32,
             })

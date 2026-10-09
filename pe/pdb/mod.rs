@@ -10,6 +10,7 @@ pub mod hash;
 pub mod info;
 pub mod msf;
 pub mod names;
+pub mod symbols;
 
 use dbi::{Dbi, Module, NIL_STREAM, Section, SectionContrib};
 use hash::{StringMap, hash_v1};
@@ -58,6 +59,10 @@ pub struct Input {
     pub publics: Vec<gsi::Public>,
     pub contribs: Vec<SectionContrib>,
     pub sections: Vec<Section>,
+    /// The COFF groups of each output section, in section order.
+    pub groups: Vec<symbols::CoffGroup>,
+    /// The environment that the linker module records, without the PDB path.
+    pub env: symbols::Env,
     /// The COFF section headers, as they appear in the image.
     pub section_headers: Vec<u8>,
 }
@@ -83,14 +88,34 @@ fn empty_tpi() -> Vec<u8> {
 /// Index of the first stream after the module streams, which hold the
 /// globals and publics hash tables and the symbol records.
 fn symbol_streams_base(input: &Input) -> usize {
-    FIRST_MODULE + input.modules.len()
+    FIRST_MODULE + input.modules.len() + 1
+}
+
+/// Frames the symbol records of a module as its stream: the signature, the
+/// records, then an empty global refs substream.
+fn module_stream(symbols: &[u8]) -> Vec<u8> {
+    let mut s = DEBUG_SECTION_MAGIC.to_le_bytes().to_vec();
+    s.extend_from_slice(symbols);
+    s.extend_from_slice(&0u32.to_le_bytes());
+    s
 }
 
 /// Serializes every stream of the PDB, in index order, with `guid` in the info stream.
 fn streams(input: &Input, guid: [u8; 16]) -> Vec<Vec<u8>> {
     let base = symbol_streams_base(input);
     let syms = gsi::build(input.publics.clone());
-    let modules: Vec<Module> = input
+    // lld's EC names start with an empty string, which objects refer to, and
+    // the PDB path comes next. The linker module names the path.
+    let mut ec_names = StringTable::default();
+    ec_names.insert(b"");
+    let path_ni = ec_names.insert(input.pdb_path.as_bytes());
+    let ec = ec_names.serialize();
+
+    let env = symbols::Env { pdb: input.pdb_path.clone(), ..input.env.clone() };
+    let linker_syms = symbols::linker_symbols(&input.sections, &input.groups, &env);
+
+    // The objects come first, then the linker's own module, as in lld.
+    let mut modules: Vec<Module> = input
         .modules
         .iter()
         .enumerate()
@@ -100,13 +125,18 @@ fn streams(input: &Input, guid: [u8; 16]) -> Vec<Vec<u8>> {
             stream: (FIRST_MODULE + i) as u16,
             sym_bytes: 4 + m.symbols.len() as u32,
             first_contrib: m.first_contrib,
+            pdb_path_ni: 0,
         })
         .collect();
-    // lld's EC names start with an empty string, which objects refer to.
-    let mut ec_names = StringTable::default();
-    ec_names.insert(b"");
-    ec_names.insert(input.pdb_path.as_bytes());
-    let ec = ec_names.serialize();
+    modules.push(Module {
+        name: "* Linker *".to_string(),
+        obj_name: String::new(),
+        stream: (FIRST_MODULE + input.modules.len()) as u16,
+        sym_bytes: 4 + linker_syms.len() as u32,
+        first_contrib: symbols::linker_contrib(),
+        pdb_path_ni: path_ni,
+    });
+
     let dbi = Dbi {
         age: input.age,
         machine: input.machine,
@@ -134,12 +164,9 @@ fn streams(input: &Input, guid: [u8; 16]) -> Vec<Vec<u8>> {
     out[NAMES] = StringTable::default().serialize();
     out[SECTION_HEADERS] = input.section_headers.to_vec();
     for m in &input.modules {
-        let mut s = DEBUG_SECTION_MAGIC.to_le_bytes().to_vec();
-        s.extend_from_slice(&m.symbols);
-        // The global refs substream follows the line info. It is empty.
-        s.extend_from_slice(&0u32.to_le_bytes());
-        out.push(s);
+        out.push(module_stream(&m.symbols));
     }
+    out.push(module_stream(&linker_syms));
     out.push(syms.globals);
     out.push(syms.publics);
     out.push(syms.records);
