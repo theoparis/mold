@@ -14,6 +14,7 @@ use std::collections::{HashMap, VecDeque};
 use std::path::Path;
 use std::rc::Rc;
 
+use crate::import::{self, ImportMember};
 use mold_common::archive_file;
 use mold_common::fatal;
 use mold_common::mapped_file::MappedFile;
@@ -41,14 +42,21 @@ pub(crate) enum Loc {
     Abs(u32),
     /// A global name, resolved through `Linker::globals`.
     Global(u32),
+    /// An entry of the import address table, by its index in `Linker::import_slots`.
+    Import(u32),
 }
 
 /// The definition of a global name.
 #[derive(Clone, Copy, PartialEq)]
 pub(crate) enum Def {
     None,
-    Chunk { chunk: u32, value: u32 },
+    Chunk {
+        chunk: u32,
+        value: u32,
+    },
     Abs(u32),
+    /// An entry of the import address table, by its index in `Linker::import_slots`.
+    Import(u32),
 }
 
 /// A section of an input object that the link keeps.
@@ -97,6 +105,8 @@ pub(crate) struct Linker<'a> {
     global_ids: HashMap<&'a [u8], u32>,
     /// The archive member that defines each remembered name.
     lazy: HashMap<&'a [u8], u32>,
+    /// The import slots of the included import members, by index.
+    pub(crate) import_slots: Vec<ImportMember<'a>>,
     /// Archive members waiting to be included, and whether each was queued.
     queue: VecDeque<u32>,
     queued: Vec<bool>,
@@ -120,6 +130,7 @@ impl<'a> Linker<'a> {
             globals: Vec::new(),
             global_ids: HashMap::new(),
             lazy: HashMap::new(),
+            import_slots: Vec::new(),
             queue: VecDeque::new(),
             queued: Vec::new(),
             next_seq: 0,
@@ -147,16 +158,39 @@ impl<'a> Linker<'a> {
         }
         if data.starts_with(b"!<arch>\n") {
             let mut member_at: HashMap<usize, u32> = HashMap::new();
+            // An import member's `__imp_` name is in the archive's symbol table.
+            let symbols = archive_symbols(data);
             for member in archive_file::read_archive_members(Path::new(""), mf) {
                 let mdata = member.data();
-                // Members that aren't COFF objects, such as rustc's metadata
-                // and import libraries, hold nothing for the image.
+                let offset = member.offset() - AR_HEADER_SIZE;
+                let name = format!("{}({})", path.display(), member.name.display());
+                if import::is_import(mdata) {
+                    let imp_name = symbols
+                        .iter()
+                        .find(|(n, o)| *o == offset && n.starts_with(b"__imp_"))
+                        .map(|(n, _)| *n);
+                    let Some(imp_name) = imp_name else {
+                        fatal!("{name}: import member without an __imp_ symbol");
+                    };
+                    let imp =
+                        import::parse(mdata, imp_name).unwrap_or_else(|e| fatal!("{name}: {e}"));
+                    let oi = self.push_object(Object {
+                        name,
+                        machine: 0,
+                        sections: Vec::new(),
+                        symbols: Vec::new(),
+                        import: Some(imp),
+                    });
+                    member_at.insert(offset, oi);
+                    continue;
+                }
+                // Members that aren't COFF objects, such as rustc's metadata, hold
+                // nothing for the image.
                 if !coff::is_coff_object(mdata) {
                     continue;
                 }
-                let name = format!("{}({})", path.display(), member.name.display());
                 let oi = self.push_object(parse_object(name, mdata));
-                member_at.insert(member.offset() - AR_HEADER_SIZE, oi);
+                member_at.insert(offset, oi);
             }
 
             // Like lld, go through the symbol table in its order. A name that
@@ -256,6 +290,15 @@ impl<'a> Linker<'a> {
     /// it refers to are recorded, and may queue archive members.
     fn include(&mut self, oi: u32) {
         self.included[oi as usize] = true;
+        // An import member defines its `__imp_` name, as an entry in the import
+        // address table, which the loader fills in. It has no other contents.
+        if let Some(imp) = self.objs[oi as usize].import.clone() {
+            let slot = self.import_slots.len() as u32;
+            self.import_slots.push(imp.clone());
+            let gid = self.intern(imp.imp_name);
+            self.define(gid, Def::Import(slot), oi);
+            return;
+        }
         let machine = self.objs[oi as usize].machine;
         match (self.machine, self.opts.machine) {
             (_, Some(want)) if want != machine => fatal!(
@@ -469,6 +512,7 @@ impl<'a> Linker<'a> {
             match g.def {
                 Def::Chunk { chunk, value } => return Some(Loc::Chunk { chunk, value }),
                 Def::Abs(v) => return Some(Loc::Abs(v)),
+                Def::Import(slot) => return Some(Loc::Import(slot)),
                 Def::None => gid = g.weak_default?,
             }
         }

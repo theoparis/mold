@@ -14,6 +14,7 @@ pub mod coff;
 
 mod arch;
 mod image;
+mod import;
 mod link;
 mod pdb;
 

@@ -11,6 +11,7 @@ use mold_common::util::align_to;
 use crate::arch::x86_64::X86_64;
 use crate::arch::{Arch, Fixup, RelocError, Target};
 use crate::coff::{self, SCN_CNT_CODE, SCN_CNT_INITIALIZED_DATA, SCN_CNT_UNINITIALIZED_DATA};
+use crate::import::ImportMember;
 use crate::link::{Linker, Loc};
 use crate::pdb::gsi;
 use crate::pdb::{self, dbi::SectionContrib};
@@ -29,6 +30,8 @@ const OPTIONAL_HEADER_SIZE: usize = 240;
 const SECTION_HEADER_SIZE: usize = 40;
 const NUM_DATA_DIRECTORIES: usize = 16;
 const BASE_RELOC_DIRECTORY: usize = 5;
+const IMPORT_DIRECTORY: usize = 1;
+const IAT_DIRECTORY: usize = 12;
 const DEBUG_DIRECTORY: usize = 6;
 /// The size of an IMAGE_DEBUG_DIRECTORY entry.
 const DEBUG_DIRECTORY_SIZE: usize = 28;
@@ -144,6 +147,31 @@ fn build_for<A: Arch>(
         out.virt_size = cursor;
     }
 
+    // lld puts the import tables at the end of .rdata, ahead of the debug directory.
+    let import_at = (!ln.import_slots.is_empty()).then(|| {
+        let len = import_tables(&ln.import_slots, 0).bytes.len() as u64;
+        let idx = match outs.iter().position(|o| o.name == b".rdata") {
+            Some(i) => i,
+            None => {
+                outs.push(OutSection {
+                    name: b".rdata".to_vec(),
+                    chars: SCN_CNT_INITIALIZED_DATA | coff::SCN_MEM_READ,
+                    members: Vec::new(),
+                    init_size: 0,
+                    virt_size: 0,
+                    rva: 0,
+                    raw_off: 0,
+                    raw_size: 0,
+                });
+                outs.len() - 1
+            }
+        };
+        let out = &mut outs[idx];
+        let at = align_to(out.virt_size, 8);
+        out.virt_size = at + len;
+        out.init_size = out.virt_size;
+        (idx, at)
+    });
     // lld keeps the debug directory and its CodeView record at the end of
     // .rdata, so they take part in its layout. The record is as long as the
     // path, which is known before the PDB is written.
@@ -202,6 +230,10 @@ fn build_for<A: Arch>(
         let out = &outs[idx];
         (out.rva + at, (out.raw_off + at) as usize, rec_len)
     });
+    // The import tables, now that their place in the file is known.
+    let imports = import_at.map(|(idx, at)| import_tables(&ln.import_slots, outs[idx].rva + at));
+    let import_file = import_at.map(|(idx, at)| (outs[idx].raw_off + at) as usize);
+    let import_rva: Vec<u64> = imports.as_ref().map_or_else(Vec::new, |t| t.slot_rva.clone());
     // The RVA and file offset of every chunk that the image keeps.
     let mut chunk_rva = vec![0u64; ln.chunks.len()];
     let mut chunk_file = vec![0u64; ln.chunks.len()];
@@ -214,6 +246,9 @@ fn build_for<A: Arch>(
     }
 
     let mut image = vec![0u8; file as usize];
+    if let (Some(t), Some(at)) = (&imports, import_file) {
+        put(&mut image, at, &t.bytes);
+    }
     // Like lld, pad code with int3, so that the gaps between functions hold it.
     for out in outs.iter().filter(|o| o.chars & SCN_CNT_CODE != 0) {
         let at = out.raw_off as usize;
@@ -235,7 +270,16 @@ fn build_for<A: Arch>(
     let mut sites = Vec::new();
     for c in 0..ln.chunks.len() {
         if ln.chunks[c].live {
-            apply_relocs::<A>(ln, c, image_base, &chunk_rva, &chunk_file, &mut image, &mut sites);
+            apply_relocs::<A>(
+                ln,
+                c,
+                image_base,
+                &import_rva,
+                &chunk_rva,
+                &chunk_file,
+                &mut image,
+                &mut sites,
+            );
         }
     }
 
@@ -294,6 +338,8 @@ fn build_for<A: Arch>(
         size_of_headers: headers_size,
         reloc_dir,
         debug_dir: debug_slot.map_or((0, 0), |(rva, _, _)| (rva, DEBUG_DIRECTORY_SIZE as u64)),
+        import_dir: imports.as_ref().map_or((0, 0), |t| (t.dir_rva, t.dir_size)),
+        iat_dir: imports.as_ref().map_or((0, 0), |t| (t.iat_rva, t.iat_size)),
     };
     let sections: Vec<&OutSection> = outs.iter().filter(|o| o.virt_size > 0).collect();
     let debug_record = debug_slot.map(|(rva, off, len)| {
@@ -317,7 +363,10 @@ fn pdb_input<A: Arch>(
     let mut modules = Vec::new();
     // lld lists modules in the order it included the objects, which for archive
     // members is the order they were pulled in, not the order they were read.
-    let mut included: Vec<usize> = (0..ln.objs.len()).filter(|&oi| ln.included[oi]).collect();
+    // Import members have no sections. lld describes them as "Import:" modules, with
+    // their thunks, which are not written yet.
+    let mut included: Vec<usize> =
+        (0..ln.objs.len()).filter(|&oi| ln.included[oi] && ln.objs[oi].import.is_none()).collect();
     included.sort_by_key(|&oi| ln.file_seq[oi]);
     for oi in included {
         let obj = &ln.objs[oi];
@@ -545,6 +594,7 @@ fn apply_relocs<A: Arch>(
     ln: &Linker<'_>,
     c: usize,
     image_base: u64,
+    import_rva: &[u64],
     chunk_rva: &[u64],
     chunk_file: &[u64],
     image: &mut [u8],
@@ -567,7 +617,7 @@ fn apply_relocs<A: Arch>(
             kind: r.kind,
             at: (p_base_off + r.offset as u64) as usize,
             rva: p_base_rva + r.offset as u64,
-            target: target_of(ln, ch.obj, r.symbol, chunk_rva, &obj.name),
+            target: target_of(ln, ch.obj, r.symbol, import_rva, chunk_rva, &obj.name),
             image_base,
         };
         match A::apply(image, fixup) {
@@ -591,7 +641,14 @@ fn rva32(rva: u64) -> u32 {
 }
 
 /// Resolves a symbol referenced by a relocation to an address.
-fn target_of(ln: &Linker<'_>, oi: u32, symbol: u32, chunk_rva: &[u64], file: &str) -> Target {
+fn target_of(
+    ln: &Linker<'_>,
+    oi: u32,
+    symbol: u32,
+    import_rva: &[u64],
+    chunk_rva: &[u64],
+    file: &str,
+) -> Target {
     let sym_name =
         || String::from_utf8_lossy(ln.objs[oi as usize].symbols[symbol as usize].name).into_owned();
     let loc = ln.locs[oi as usize][symbol as usize];
@@ -608,6 +665,7 @@ fn target_of(ln: &Linker<'_>, oi: u32, symbol: u32, chunk_rva: &[u64], file: &st
             Target::Image(chunk_rva[chunk as usize] + value as u64)
         }
         Some(Loc::Abs(v)) => Target::Abs(v as u64),
+        Some(Loc::Import(slot)) => Target::Image(import_rva[slot as usize]),
         _ => fatal!("{file}: relocation refers to undefined symbol {}", sym_name()),
     }
 }
@@ -656,6 +714,8 @@ struct Headers {
     size_of_headers: u64,
     reloc_dir: (u64, u64),
     debug_dir: (u64, u64),
+    import_dir: (u64, u64),
+    iat_dir: (u64, u64),
 }
 
 /// Writes the IMAGE_DEBUG_DIRECTORY entry at `dir_rva` and `dir_off`. The
@@ -729,6 +789,12 @@ fn write_headers(image: &mut [u8], h: &Headers, sections: &[&OutSection]) {
     let debug = opt + 112 + DEBUG_DIRECTORY * 8;
     put(image, debug, &(h.debug_dir.0 as u32).to_le_bytes());
     put(image, debug + 4, &(h.debug_dir.1 as u32).to_le_bytes());
+    let import = opt + 112 + IMPORT_DIRECTORY * 8;
+    put(image, import, &(h.import_dir.0 as u32).to_le_bytes());
+    put(image, import + 4, &(h.import_dir.1 as u32).to_le_bytes());
+    let iat = opt + 112 + IAT_DIRECTORY * 8;
+    put(image, iat, &(h.iat_dir.0 as u32).to_le_bytes());
+    put(image, iat + 4, &(h.iat_dir.1 as u32).to_le_bytes());
 
     // Section table. A section with initialized data has no uninitialized
     // flag: its uninitialized tail is just part of its virtual size.
@@ -797,4 +863,95 @@ fn module_names(name: &str) -> (String, String) {
         Some((archive, member)) => (member.to_string(), absolute(archive)),
         None => (absolute(name), absolute(name)),
     }
+}
+
+/// The size of an `IMAGE_IMPORT_DESCRIPTOR`.
+const IMPORT_DESCRIPTOR_SIZE: u64 = 20;
+/// The flag that marks an import by ordinal in a lookup table entry.
+const ORDINAL_FLAG: u64 = 1 << 63;
+
+/// The import tables that lld puts in .rdata, laid out from `base`: the import
+/// directory, each DLL's lookup table, the address tables, the hint and name
+/// entries, and the DLL names. DLLs are listed by their lowercase names, and
+/// each DLL's imports by name, as lld orders them.
+struct ImportTables {
+    bytes: Vec<u8>,
+    dir_rva: u64,
+    dir_size: u64,
+    iat_rva: u64,
+    iat_size: u64,
+    /// The RVA of each import slot, indexed like `Linker::import_slots`.
+    slot_rva: Vec<u64>,
+}
+
+/// Reserves `len` bytes at `cursor`, returning where they start.
+fn take(cursor: &mut u64, len: u64) -> u64 {
+    let at = *cursor;
+    *cursor += len;
+    at
+}
+
+fn import_tables(slots: &[ImportMember<'_>], base: u64) -> ImportTables {
+    // Group the slots by DLL, in the order each DLL is first imported from, as lld
+    // does. DLL names compare without case.
+    let mut dlls: Vec<(&[u8], Vec<usize>)> = Vec::new();
+    for (i, s) in slots.iter().enumerate() {
+        let lower = s.dll.to_ascii_lowercase();
+        match dlls.iter_mut().find(|(d, _)| d.to_ascii_lowercase() == lower) {
+            Some((_, list)) => list.push(i),
+            None => dlls.push((s.dll, vec![i])),
+        }
+    }
+    for (_, list) in &mut dlls {
+        list.sort_by(|&a, &b| slots[a].symbol.cmp(slots[b].symbol));
+    }
+
+    let dir_size = IMPORT_DESCRIPTOR_SIZE * (dlls.len() as u64 + 1);
+    // The lookup and address tables are 8-byte aligned, after the directory.
+    let mut cursor = dir_size.next_multiple_of(8);
+    let ilt: Vec<u64> =
+        dlls.iter().map(|(_, l)| take(&mut cursor, 8 * (l.len() as u64 + 1))).collect();
+    let iat_start = cursor;
+    let iat: Vec<u64> =
+        dlls.iter().map(|(_, l)| take(&mut cursor, 8 * (l.len() as u64 + 1))).collect();
+    let iat_size = cursor - iat_start;
+    let mut hint_at = vec![0u64; slots.len()];
+    for (_, list) in &dlls {
+        for &i in list {
+            if slots[i].ordinal.is_none() {
+                let len = (2 + slots[i].export.len() as u64 + 1).next_multiple_of(2);
+                hint_at[i] = take(&mut cursor, len);
+            }
+        }
+    }
+    let name_at: Vec<u64> =
+        dlls.iter().map(|(d, _)| take(&mut cursor, d.len() as u64 + 1)).collect();
+
+    let mut bytes = vec![0u8; cursor as usize];
+    let mut slot_rva = vec![0u64; slots.len()];
+    for (d, (dll, list)) in dlls.iter().enumerate() {
+        let desc = d * IMPORT_DESCRIPTOR_SIZE as usize;
+        put(&mut bytes, desc, &((base + ilt[d]) as u32).to_le_bytes());
+        // The TimeDateStamp and ForwarderChain fields stay zero.
+        put(&mut bytes, desc + 12, &((base + name_at[d]) as u32).to_le_bytes());
+        put(&mut bytes, desc + 16, &((base + iat[d]) as u32).to_le_bytes());
+        put(&mut bytes, name_at[d] as usize, dll);
+        for (j, &i) in list.iter().enumerate() {
+            let slot = &slots[i];
+            let entry = match slot.ordinal {
+                Some(ordinal) => ORDINAL_FLAG | ordinal as u64,
+                None => base + hint_at[i],
+            };
+            let off = 8 * j;
+            put(&mut bytes, ilt[d] as usize + off, &entry.to_le_bytes());
+            put(&mut bytes, iat[d] as usize + off, &entry.to_le_bytes());
+            slot_rva[i] = base + iat[d] + off as u64;
+            if slot.ordinal.is_none() {
+                put(&mut bytes, hint_at[i] as usize, &slot.hint.to_le_bytes());
+                put(&mut bytes, hint_at[i] as usize + 2, &slot.export);
+            }
+        }
+    }
+
+    ImportTables { bytes, dir_rva: base, dir_size, iat_rva: base + iat_start, iat_size, slot_rva }
 }

@@ -38,6 +38,8 @@ pub struct Object<'a> {
     pub name: String,
     pub sections: Vec<Section<'a>>,
     pub symbols: Vec<Symbol<'a>>,
+    /// For an import member, the symbol that the DLL exports. Its objects have no sections.
+    pub import: Option<crate::import::ImportMember<'a>>,
 }
 
 pub struct Section<'a> {
@@ -198,7 +200,7 @@ pub fn parse<'a>(name: String, data: &'a [u8]) -> Result<Object<'a>, String> {
         }
     }
 
-    Ok(Object { name, machine, sections, symbols })
+    Ok(Object { name, machine, sections, symbols, import: None })
 }
 
 fn read_relocs(
