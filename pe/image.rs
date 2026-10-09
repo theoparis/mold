@@ -11,7 +11,7 @@ use mold_common::util::align_to;
 use crate::arch::x86_64::X86_64;
 use crate::arch::{Arch, Fixup, RelocError, Target};
 use crate::coff::{self, SCN_CNT_CODE, SCN_CNT_INITIALIZED_DATA, SCN_CNT_UNINITIALIZED_DATA};
-use crate::link::{Def, Linker, Loc};
+use crate::link::{Linker, Loc};
 use crate::pdb::gsi;
 use crate::pdb::{self, dbi::SectionContrib};
 
@@ -315,16 +315,19 @@ fn pdb_input<A: Arch>(
 ) -> pdb::Input {
     let mut module_of = vec![None; ln.objs.len()];
     let mut modules = Vec::new();
-    for (oi, obj) in ln.objs.iter().enumerate() {
-        if ln.included[oi] {
-            module_of[oi] = Some(modules.len() as u16);
-            modules.push(pdb::ModuleInput {
-                name: module_names(&obj.name).0,
-                obj_name: module_names(&obj.name).1,
-                symbols: Vec::new(),
-                first_contrib: SectionContrib::default(),
-            });
-        }
+    // lld lists modules in the order it included the objects, which for archive
+    // members is the order they were pulled in, not the order they were read.
+    let mut included: Vec<usize> = (0..ln.objs.len()).filter(|&oi| ln.included[oi]).collect();
+    included.sort_by_key(|&oi| ln.file_seq[oi]);
+    for oi in included {
+        let obj = &ln.objs[oi];
+        module_of[oi] = Some(modules.len() as u16);
+        modules.push(pdb::ModuleInput {
+            name: module_names(&obj.name).0,
+            obj_name: module_names(&obj.name).1,
+            symbols: Vec::new(),
+            first_contrib: SectionContrib::default(),
+        });
     }
 
     let mut contribs = Vec::new();
@@ -383,8 +386,10 @@ fn pdb_input<A: Arch>(
     // lld leaves out the coverage symbols, which double the size of publics.
     const COVERAGE_PREFIXES: [&[u8]; 3] = [b"__profd_", b"__profc_", b"__covrec_"];
     let mut publics = Vec::new();
-    for g in &ln.globals {
-        let Def::Chunk { chunk, value } = g.def else {
+    for gi in 0..ln.globals.len() {
+        let g = &ln.globals[gi];
+        // A weak external defers to its default, so follow the name's resolution.
+        let Some(Loc::Chunk { chunk, value }) = ln.resolve(gi as u32) else {
             continue;
         };
         let Some((segment, base)) = chunk_loc[chunk as usize] else {
