@@ -68,7 +68,12 @@ impl<'a> ArHeader<'a> {
         if let Some(rest) = self.name.strip_prefix(b"/") {
             let offset = parse_decimal(rest);
             let start = strtab.get(offset..).unwrap_or(&[]);
-            let end = memchr::memmem::find(start, b"/\n").unwrap_or(start.len());
+            // Some archives end a name with "/\n", and others with "\0\n" or a
+            // bare "\n". A file name contains none of these, so stop at any.
+            let end = start
+                .iter()
+                .position(|&b| matches!(b, b'/' | b'\n' | b'\0'))
+                .unwrap_or(start.len());
             return PathBuf::from(util::os_str(&start[..end]));
         }
 
