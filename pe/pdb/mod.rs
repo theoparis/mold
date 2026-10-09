@@ -5,6 +5,7 @@
 //! a GUID that is a hash of the other streams, so it is serialized twice.
 
 pub mod dbi;
+pub mod gsi;
 pub mod hash;
 pub mod info;
 pub mod msf;
@@ -33,6 +34,8 @@ const FIRST_MODULE: usize = 8;
 /// `PdbTpiV80`, and the first type index that TPI and IPI number from.
 const TPI_VERSION_V80: u32 = 20040203;
 const FIRST_TYPE_INDEX: u32 = 0x1000;
+/// The largest TPI hash bucket count that the reader accepts.
+const MAX_TPI_HASH_BUCKETS: u32 = 0x40000;
 
 /// One object's contribution to the PDB.
 pub struct ModuleInput {
@@ -51,6 +54,8 @@ pub struct Input {
     pub pdb_path: String,
     pub machine: u16,
     pub modules: Vec<ModuleInput>,
+    /// The defined external symbols that the publics list names.
+    pub publics: Vec<gsi::Public>,
     pub contribs: Vec<SectionContrib>,
     pub sections: Vec<Section>,
     /// The COFF section headers, as they appear in the image.
@@ -68,13 +73,23 @@ fn empty_tpi() -> Vec<u8> {
     out.extend_from_slice(&NIL_STREAM.to_le_bytes()); // HashStreamIndex
     out.extend_from_slice(&NIL_STREAM.to_le_bytes()); // HashAuxStreamIndex
     out.extend_from_slice(&4u32.to_le_bytes()); // HashKeySize
-    out.extend_from_slice(&0u32.to_le_bytes()); // NumHashBuckets
+    // LLVM's builder always writes this count, and the reader accepts only
+    // counts from 0x1000 to 0x40000.
+    out.extend_from_slice(&(MAX_TPI_HASH_BUCKETS - 1).to_le_bytes());
     out.resize(56, 0); // Hash and index buffers: all empty.
     out
 }
 
+/// Index of the first stream after the module streams, which hold the
+/// globals and publics hash tables and the symbol records.
+fn symbol_streams_base(input: &Input) -> usize {
+    FIRST_MODULE + input.modules.len()
+}
+
 /// Serializes every stream of the PDB, in index order, with `guid` in the info stream.
 fn streams(input: &Input, guid: [u8; 16]) -> Vec<Vec<u8>> {
+    let base = symbol_streams_base(input);
+    let syms = gsi::build(input.publics.clone());
     let modules: Vec<Module> = input
         .modules
         .iter()
@@ -93,9 +108,9 @@ fn streams(input: &Input, guid: [u8; 16]) -> Vec<Vec<u8>> {
     let dbi = Dbi {
         age: input.age,
         machine: input.machine,
-        global_stream: NIL_STREAM,
-        public_stream: NIL_STREAM,
-        sym_record_stream: NIL_STREAM,
+        global_stream: base as u16,
+        public_stream: (base + 1) as u16,
+        sym_record_stream: (base + 2) as u16,
         modules: &modules,
         contribs: &input.contribs,
         sections: &input.sections,
@@ -123,6 +138,9 @@ fn streams(input: &Input, guid: [u8; 16]) -> Vec<Vec<u8>> {
         s.extend_from_slice(&0u32.to_le_bytes());
         out.push(s);
     }
+    out.push(syms.globals);
+    out.push(syms.publics);
+    out.push(syms.records);
     out
 }
 

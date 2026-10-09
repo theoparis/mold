@@ -73,6 +73,8 @@ pub struct Symbol<'a> {
     /// 1-based section number, or one of the special values 0, -1 and -2.
     pub section: i16,
     pub storage: u8,
+    /// The type field: the base type in the low nibble, the complex type above it.
+    pub typ: u16,
     /// True for the auxiliary records that follow a symbol.
     pub aux_slot: bool,
     /// For a weak external, the index of the symbol it defaults to.
@@ -153,6 +155,7 @@ pub fn parse<'a>(name: String, data: &'a [u8]) -> Result<Object<'a>, String> {
             value: le32(&r[8..12]),
             section,
             storage,
+            typ: le16(&r[14..16]),
             aux_slot: false,
             weak_default: None,
         });
@@ -176,6 +179,7 @@ pub fn parse<'a>(name: String, data: &'a [u8]) -> Result<Object<'a>, String> {
                 value: 0,
                 section: 0,
                 storage: 0,
+                typ: 0,
                 aux_slot: true,
                 weak_default: None,
             });

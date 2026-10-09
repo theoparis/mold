@@ -11,7 +11,8 @@ use mold_common::util::align_to;
 use crate::arch::x86_64::X86_64;
 use crate::arch::{Arch, Fixup, RelocError, Target};
 use crate::coff::{self, SCN_CNT_CODE, SCN_CNT_INITIALIZED_DATA, SCN_CNT_UNINITIALIZED_DATA};
-use crate::link::{Linker, Loc};
+use crate::link::{Def, Linker, Loc};
+use crate::pdb::gsi;
 use crate::pdb::{self, dbi::SectionContrib};
 
 /// The image base that lld uses for executables, so that 32-bit absolute
@@ -351,9 +352,52 @@ fn pdb_input<A: Arch>(
 
     let start = (PE_OFFSET + 4 + COFF_HEADER_SIZE + OPTIONAL_HEADER_SIZE) as usize;
     let len = SECTION_HEADER_SIZE as usize * sections.len();
+
+    // Where each chunk that the image keeps is: its section number and offset.
+    let mut chunk_loc: Vec<Option<(u16, u32)>> = vec![None; ln.chunks.len()];
+    for (si, out) in sections.iter().enumerate() {
+        for m in &out.members {
+            chunk_loc[m.chunk as usize] =
+                Some(((si + 1) as u16, ln.chunks[m.chunk as usize].offset));
+        }
+    }
+    // Names that the objects define as functions, which lld flags in publics.
+    let functions: std::collections::HashSet<&[u8]> = ln
+        .objs
+        .iter()
+        .flat_map(|o| o.symbols.iter())
+        .filter(|s| {
+            s.storage == coff::CLASS_EXTERNAL
+                && s.section > 0
+                && s.typ & 0x0f == 0
+                && s.typ & 0xf0 == 0x20
+        })
+        .map(|s| s.name)
+        .collect();
+    // lld leaves out the coverage symbols, which double the size of publics.
+    const COVERAGE_PREFIXES: [&[u8]; 3] = [b"__profd_", b"__profc_", b"__covrec_"];
+    let mut publics = Vec::new();
+    for g in &ln.globals {
+        let Def::Chunk { chunk, value } = g.def else {
+            continue;
+        };
+        let Some((segment, base)) = chunk_loc[chunk as usize] else {
+            continue;
+        };
+        if COVERAGE_PREFIXES.iter().any(|p| g.name.starts_with(p)) {
+            continue;
+        }
+        publics.push(gsi::Public {
+            name: g.name.to_vec(),
+            segment,
+            offset: base + value,
+            function: functions.contains(g.name),
+        });
+    }
     pdb::Input {
         age: 1,
         pdb_path: pdb_path.unwrap_or_default().to_string(),
+        publics,
         machine: A::MACHINE,
         modules,
         contribs,
