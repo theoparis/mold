@@ -18,6 +18,8 @@ pub struct X86_64;
 
 impl Arch for X86_64 {
     const MACHINE: u16 = MACHINE;
+    const SECTION_RELOC: u16 = 0x000a;
+    const SECREL_RELOC: u16 = 0x000b;
 
     fn has_base_reloc(kind: u16) -> bool {
         kind == IMAGE_REL_AMD64_ADDR64 || kind == IMAGE_REL_AMD64_ADDR32

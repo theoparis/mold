@@ -62,6 +62,11 @@ pub(crate) trait Arch {
     /// The COFF machine type (`IMAGE_FILE_MACHINE_*`) of the architecture.
     const MACHINE: u16;
 
+    /// The relocation that stores a symbol's section number in a 16-bit field.
+    const SECTION_RELOC: u16;
+    /// The relocation that stores a symbol's offset in its section in a 32-bit field.
+    const SECREL_RELOC: u16;
+
     /// Returns true if a relocation of this type can leave an absolute
     /// address in the image, which then needs a base relocation entry.
     fn has_base_reloc(kind: u16) -> bool;

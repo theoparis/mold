@@ -102,7 +102,9 @@ fn streams(input: &Input, guid: [u8; 16]) -> Vec<Vec<u8>> {
             first_contrib: m.first_contrib,
         })
         .collect();
+    // lld's EC names start with an empty string, which objects refer to.
     let mut ec_names = StringTable::default();
+    ec_names.insert(b"");
     ec_names.insert(input.pdb_path.as_bytes());
     let ec = ec_names.serialize();
     let dbi = Dbi {
@@ -181,5 +183,25 @@ pub fn codeview_record(guid: [u8; 16], age: u32, path: &str) -> Vec<u8> {
     out.extend_from_slice(&age.to_le_bytes());
     out.extend_from_slice(path.as_bytes());
     out.push(0);
+    out
+}
+
+/// The subsection kind that holds a module's symbol records.
+const DEBUG_S_SYMBOLS: u32 = 0xf1;
+
+/// Returns the symbol records of a `.debug$S` section, which are the payloads
+/// of its symbol subsections. The section starts with its signature.
+pub fn symbol_records(debug_s: &[u8]) -> Vec<u8> {
+    let mut out = Vec::new();
+    let mut pos = 4;
+    while pos + 8 <= debug_s.len() {
+        let kind = u32::from_le_bytes(debug_s[pos..pos + 4].try_into().unwrap());
+        let len = u32::from_le_bytes(debug_s[pos + 4..pos + 8].try_into().unwrap()) as usize;
+        let end = (pos + 8 + len).min(debug_s.len());
+        if kind == DEBUG_S_SYMBOLS {
+            out.extend_from_slice(&debug_s[pos + 8..end]);
+        }
+        pos = end.next_multiple_of(4);
+    }
     out
 }

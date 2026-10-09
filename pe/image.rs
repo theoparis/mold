@@ -319,8 +319,8 @@ fn pdb_input<A: Arch>(
         if ln.included[oi] {
             module_of[oi] = Some(modules.len() as u16);
             modules.push(pdb::ModuleInput {
-                name: obj.name.clone(),
-                obj_name: obj.name.clone(),
+                name: module_names(&obj.name).0,
+                obj_name: module_names(&obj.name).1,
                 symbols: Vec::new(),
                 first_contrib: SectionContrib::default(),
             });
@@ -360,6 +360,12 @@ fn pdb_input<A: Arch>(
             chunk_loc[m.chunk as usize] =
                 Some(((si + 1) as u16, ln.chunks[m.chunk as usize].offset));
         }
+    }
+    // The symbol records of each module, with the addresses its relocations fill in.
+    let module_objs: Vec<usize> =
+        module_of.iter().enumerate().filter_map(|(oi, m)| m.map(|_| oi)).collect();
+    for (m, &oi) in modules.iter_mut().zip(&module_objs) {
+        m.symbols = debug_symbols::<A>(ln, oi, &chunk_loc);
     }
     // Names that the objects define as functions, which lld flags in publics.
     let functions: std::collections::HashSet<&[u8]> = ln
@@ -701,5 +707,54 @@ fn write_headers(image: &mut [u8], h: &Headers, sections: &[&OutSection]) {
             o.chars
         };
         put(image, at + 36, &chars.to_le_bytes());
+    }
+}
+
+/// Returns the symbol records of object `oi`, from its `.debug$S` sections,
+/// with each address that a relocation fills in replaced by its value: the
+/// section-relative offset for `SECREL`, and the section number for `SECTION`.
+/// Addresses the image does not keep are zero.
+fn debug_symbols<A: Arch>(ln: &Linker<'_>, oi: usize, chunk_loc: &[Option<(u16, u32)>]) -> Vec<u8> {
+    let target = |symbol: u32| -> Option<(u16, u32)> {
+        let resolved = match ln.locs[oi][symbol as usize] {
+            Loc::Global(g) => ln.resolve(g),
+            other => Some(other),
+        };
+        match resolved {
+            Some(Loc::Chunk { chunk, value }) => {
+                chunk_loc[chunk as usize].map(|(segment, base)| (segment, base + value))
+            }
+            _ => None,
+        }
+    };
+    let mut out = Vec::new();
+    for sec in ln.objs[oi].sections.iter().filter(|s| s.name == b".debug$S") {
+        let mut data = sec.data.to_vec();
+        for r in &sec.relocs {
+            let at = r.offset as usize;
+            let found = target(r.symbol);
+            if r.kind == A::SECREL_RELOC && at + 4 <= data.len() {
+                let v = found.map_or(0, |(_, off)| off);
+                data[at..at + 4].copy_from_slice(&v.to_le_bytes());
+            } else if r.kind == A::SECTION_RELOC && at + 2 <= data.len() {
+                let v = found.map_or(0, |(segment, _)| segment);
+                data[at..at + 2].copy_from_slice(&v.to_le_bytes());
+            }
+        }
+        out.extend(pdb::symbol_records(&data));
+    }
+    out
+}
+
+/// The module name and object file name of an input object, as lld records
+/// them. An archive member, named `archive(member)`, is named by its member
+/// and refers to its archive. Other objects are named by their absolute path.
+fn module_names(name: &str) -> (String, String) {
+    let absolute = |p: &str| {
+        std::path::absolute(p).map_or_else(|_| p.to_string(), |a| a.display().to_string())
+    };
+    match name.strip_suffix(')').and_then(|n| n.split_once('(')) {
+        Some((archive, member)) => (member.to_string(), absolute(archive)),
+        None => (absolute(name), absolute(name)),
     }
 }
